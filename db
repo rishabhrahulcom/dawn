@@ -1,0 +1,300 @@
+Build Your Own Database
+Core Concepts & Implementation Reference
+
+
+Part I: Foundations
+1. Files vs Databases — Why Simple File IO Fails
+Writing data directly to files has three critical problems:
+Truncation race: opening a file with O_TRUNC removes data before the new write completes — concurrent readers see nothing.
+Non-atomic writes: writes larger than a page are not guaranteed to be atomic. A crash mid-write leaves a corrupt file.
+No durability guarantee: after write() returns, data may still be in the OS page cache. A power failure loses it.
+
+The Safe Pattern: Write → fsync → Atomic Rename
+The correct sequence to persist data safely:
+1. Write data to a TEMP file
+2. fsync(temp)   ← flush data to disk
+3. fsync(dir)    ← flush directory metadata (inode)
+4. rename(temp, target)  ← atomic on POSIX filesystems
+rename() is guaranteed atomic by POSIX. If the process crashes before rename(), the original file is untouched. This is why SQLite and many other databases use this pattern for small updates.
+
+Append-Only Logs — Good but Incomplete
+Appending to a file avoids truncation and is crash-safer (no rename needed), but alone it is not enough:
+No efficient lookup — querying requires scanning the whole log (O(n)).
+Deleted data accumulates — logs cannot grow forever, compaction is needed.
+Still needs fsync after each append for durability.
+Logs are a building block (used in WAL, LSM-Trees), not a complete solution.
+
+2. Indexing — How Databases Find Data Fast
+All database queries reduce to three disk operations:
+Full scan — no index, O(n). Unavoidable for analytics (OLAP).
+Point query — find a specific key. O(log n) with an index.
+Range query — find all keys in a range. O(log n + k) with a sorted index.
+
+Why Not Hash Tables?
+No ordering — range queries are impossible.
+Expensive resize — O(n) rehash causes sudden IO spikes.
+Fine for in-memory caches, bad for general-purpose on-disk indexes.
+
+B-Trees vs LSM-Trees — The Two Main Choices
+
+
+Part II: The B+ Tree
+3. B-Tree Concepts
+A B-tree is a self-balancing n-ary tree. Nodes contain multiple keys to match disk page sizes (typically 4 KB). The book uses a B+ Tree variant where:
+Internal nodes store only keys (routing information).
+Leaf nodes store key-value pairs.
+All leaf nodes are at the same depth — the tree is perfectly balanced.
+
+Why n-ary Instead of Binary?
+A binary tree with 1M keys has depth ~20. A B-tree with 4 KB pages stores ~250 keys per node, depth ~3. Fewer disk reads.
+Disk IO is page-granular (minimum 4 KB). A binary node wastes most of the page; a B-tree node fills it.
+Better CPU cache utilization — all keys in a node fit in cache simultaneously.
+
+Balancing Rules
+Split: if a node exceeds one page after insert, split into two nodes of roughly equal size. Propagate a new key up to the parent.
+Merge: if a node falls below 1/4 of a page after delete, merge it with a sibling (if the merged result fits one page).
+Root growth: when the root splits, a new root is created — the tree grows upward.
+Root shrink: when the root has only one child, the child becomes the new root — the tree shrinks.
+
+Immutable / Copy-on-Write B-Tree
+The book's implementation is immutable (copy-on-write, CoW). On every update:
+The modified node is never changed in-place — a new copy is created.
+Every ancestor in the path from root to the modified leaf is also copied with updated pointers.
+A new root pointer is produced per update.
+Benefits: (1) Crash safety — the old tree version remains valid if the update is interrupted. (2) Easy concurrency — readers work on old versions while a writer creates a new one. (3) Rollback is free — just discard the new root.
+
+4. Node Format (Binary Layout)
+Nodes are raw byte slices — the same format in memory and on disk:
+| type  | nkeys | pointers        | offsets       | key-values  |
+| 2 B   | 2 B   | nkeys × 8 B     | nkeys × 2 B   | variable    |
+
+Each KV pair:
+| klen | vlen | key    | val    |
+| 2 B  | 2 B  | klen B | vlen B |
+
+type: BNODE_NODE (1) = internal node, BNODE_LEAF (2) = leaf node.
+pointers: 64-bit page numbers for children (internal nodes only — leaves store 0).
+offsets: byte offset of each KV pair relative to the first KV. The offset of KV[n+1] gives the end of KV[n], enabling O(1) size calculation.
+Page size: 4096 bytes. Max key: 1000 bytes. Max value: 3000 bytes. A single KV pair always fits on one page.
+The pointer to child node is actually a page number, not a memory address. This allows the B-tree code to be pure data-structure code, decoupled from IO via three callbacks: get(ptr), new(node), del(ptr).
+
+5. B-Tree Operations
+Lookup (nodeLookupLE)
+Binary search within a node for the largest key ≤ target. Works for both leaf and internal nodes. The first key of a node is always ≤ any key routed here by the parent, so it is skipped in comparison.
+
+Insert Algorithm
+treeInsert(node, key, val):
+  idx = nodeLookupLE(node, key)
+  if node is LEAF:
+    if key == node.key[idx]: leafUpdate(...)   // replace
+    else: leafInsert(..., idx+1)               // insert after
+  if node is INTERNAL:
+    child = get(node.ptr[idx])
+    updated_child = treeInsert(child, key, val)
+    splits = nodeSplit3(updated_child)          // 1, 2, or 3 nodes
+    nodeReplaceKidN(node, idx, splits)
+Splitting: a node may produce 1–3 output nodes. The worst case is a very large KV pair in the middle that prevents even splits, forcing 3 nodes.
+
+Delete Algorithm
+treeDelete(node, key):
+  idx = nodeLookupLE(node, key)
+  if node is LEAF:
+    leafDelete(node, idx)
+  if node is INTERNAL:
+    updated_child = treeDelete(child, key)
+    if shouldMerge(updated_child, sibling):
+      merge(updated_child, sibling)
+    else:
+      nodeReplaceKidN(node, idx, updated_child)
+Merge condition: the node is < 1/4 page AND the merged result of the node + sibling fits in one page.
+
+Part III: Persistence
+6. Persisting the B-Tree to Disk
+The Two-Phase Commit Protocol
+Every update follows a strict two-phase write with an fsync barrier:
+Phase 1: Write all new B-tree pages to disk
+         fsync()  ← barrier — data must reach disk before phase 2
+Phase 2: Update the master page (new root pointer + page count)
+         fsync()  ← barrier — master page must reach disk before responding
+If the database crashes between phase 1 and 2, the master page still points to the old root — the update simply didn't happen. If it crashes during phase 1, the new pages are orphaned but the old tree is intact. This is crash-safe because new pages are allocated by appending, never by overwriting.
+
+The Master Page
+Page 0 is reserved as the master page — the database's entry point on startup:
+| signature (16 B) | btree_root (8 B) | page_used (8 B) | free_list_head (8 B) | version (8 B) |
+signature: a magic string (e.g. "BuildYourOwnDB05") to detect corrupt or wrong files.
+btree_root: page number of the current root node.
+page_used: total pages allocated (= database file size in pages).
+The master page is written with pwrite() (not via mmap) to guarantee atomicity — a small write that does not cross a page boundary is atomic on Linux.
+
+mmap-Based IO
+The database file is memory-mapped (mmap). Reading a page = reading from a memory address; the OS handles the disk IO transparently.
+As the file grows, the mmap region is extended by adding a new mapping (mremap would invalidate pointers, so multiple mappings are used instead).
+New pages (before fsync) are kept in a temporary in-memory slice and copied to the mmap region during writePages().
+
+Page Allocation
+Simple: new pages are appended to the end of the file (page_used is the next free page number).
+The file is extended exponentially (×1.125) to avoid frequent fallocate() calls.
+The mmap region is also extended exponentially (×2) to avoid frequent mmap() calls.
+
+7. Free List — Reusing Pages
+The CoW B-tree orphans old nodes on every update. Without reuse, the file grows forever. The free list tracks pages that are no longer reachable from the current root.
+Design
+The free list is itself stored as a persistent linked list of pages inside the database file.
+Each free list node stores: size, total item count (head only), pointer to next node, and a list of free page numbers.
+The list is immutable (CoW) like the B-tree. The head pointer is stored in the master page.
+For sequential access: FILO (stack). For concurrent access: FIFO (queue sorted by version).
+
+Update Protocol
+Update(popn, freed):
+  Phase 1: Remove `popn` items from the list head (these pages will be reused)
+  Phase 2: Collect pages needed to store the new list nodes
+           (reuse from the list itself, not from the B-tree allocator)
+  Phase 3: Prepend new nodes containing the `freed` pages
+The free list manages its own pages independently from the B-tree. It uses separate callbacks (new for appending, use for in-place reuse) to avoid circular dependencies.
+
+Part IV: Relational Layer
+8. Tables on Top of the KV Store
+Mapping Tables to KV
+Primary key columns → encoded as the KV key (with a 4-byte table prefix prepended).
+Non-primary key columns → encoded as the KV value.
+Each table has a unique 32-bit prefix allocated from the @meta internal table, preventing key collisions between tables.
+Table definitions (schema) are stored as JSON in the @table internal table.
+
+Supported Types (minimal)
+TYPE_INT64 (2): 64-bit signed integer.
+TYPE_BYTES (1): variable-length byte slice.
+
+Update Modes
+MODE_UPSERT (0): insert or replace (equivalent to SQL REPLACE INTO).
+MODE_UPDATE_ONLY (1): fail if key does not exist.
+MODE_INSERT_ONLY (2): fail if key already exists.
+
+9. Order-Preserving Encoding (for Range Queries)
+For range queries to work via byte comparison, the binary encoding of keys must preserve sort order. This lets the B-tree compare keys byte-by-byte without deserialization.
+Encoding Rules
+Unsigned integers: big-endian encoding is naturally order-preserving.
+Signed integers: flip the sign bit first: u = uint64(i64) + (1<<63), then big-endian encode.
+Byte strings: null-terminated. Escape \x00 as \x01\x01 and \x01 as \x01\x02. Escape \xff and \xfe at the first byte (for MAX sentinel support).
+Multi-column keys: concatenate encoded columns in order.
+MAX Sentinel
+For range queries like key < (v, MAX), a maximum value placeholder is needed:
+For INT64: append 8 × 0xFF bytes.
+For BYTES: append 0xFF (no valid string encoding starts with 0xFF after escaping).
+
+10. Range Query — B-Tree Iterator
+BIter: Path-Based Iterator
+The BIter stores the full path from root to the current leaf position:
+path[]: the BNode at each level from root (0) to leaf (last).
+pos[]: the index within each node at the corresponding level.
+Moving to the next/previous key is O(1) amortized: usually just increment/decrement pos at the leaf level; if at a boundary, walk up to the parent and then back down.
+SeekLE(key) → BIter
+Standard B-tree traversal recording the path. For other operators (GT, GE, LT), the result may be off by one — call Seek() which adjusts by calling Next() or Prev() as needed.
+Scanner — Table-Level Range Query
+Wraps BIter with table awareness (table def, prefix, index selection).
+Valid(): checks current iterator key against the end bound using cmpOK().
+Next()/Prev(): delegates to BIter based on scan direction.
+Deref(): decodes the current KV pair into a Record.
+
+11. Secondary Indexes
+How Secondary Indexes Work
+Each secondary index is a separate KV prefix in the B-tree.
+Index key = encoded index columns + primary key columns (appended to ensure uniqueness).
+Index value = empty (the primary key is already in the index key).
+To fetch a full row via a secondary index: decode the primary key from the index key, then do a primary key lookup.
+Maintaining Indexes
+On every row update or delete:
+DELETE old index entry (using the old column values, retrieved from InsertReq.Old).
+INSERT new index entry (using the new column values).
+This requires atomic multi-key updates — handled by transactions (Chapter 11).
+Index Selection
+An index is selected if its columns form a prefix of the query's specified columns. The shortest matching index wins. If no secondary index matches, the primary key is used (full table scan if no columns specified).
+
+Part V: Transactions & Concurrency
+12. Atomic Transactions
+A transaction groups multiple KV updates into an all-or-nothing operation. This is critical for secondary index maintenance — updating a row touches multiple KV keys.
+Transaction Lifecycle
+tx = Begin()        ← snapshot root + free list head
+tx.Get/Set/Del(...)  ← in-memory B-tree operations (no IO)
+Commit(tx)          ← Phase 1: write pages; Phase 2: update master
+    OR
+Abort(tx)           ← restore root + free list head (no IO)
+Rollback Implementation
+Because the tree is immutable, rollback is trivial:
+Save kv.tree.root and kv.free.head at Begin().
+On Abort(): restore those values and clear the pending page updates map.
+On Phase 1 failure during Commit(): same rollback, then return the error.
+Phase 2 failure (master page write) cannot be rolled back safely — we don't know if the write succeeded. But phase 2 is a single small write and is atomic on Linux, so failures are extremely unlikely.
+
+13. Concurrent Readers and Writers
+Concurrency Model
+
+
+Implementation: Two Transaction Types
+KVReader: holds a snapshot (root + mmap chunks copy). Read-only. No locks held after BeginRead().
+KVTX (read-write): holds writer mutex for its entire lifetime. Extends KVReader. Owns free list and page updates.
+
+Mutex Strategy
+writer mutex: acquired at Begin(), released at Commit() or Abort(). Serializes all writers.
+mu mutex (lightweight): protects kv.tree.root, kv.version, and kv.mmap.chunks — fields read by readers and written by the writer on commit. Held only briefly.
+
+Version Numbers & Safe Page Reuse
+Each committed transaction increments the database version number. Free list nodes store the version when a page was freed. A freed page can only be reused when:
+freed_version < min(active_reader_versions)
+Active reader versions are tracked in a min-heap (ReaderList). The oldest reader version is heap[0].
+Long-running read transactions prevent page reuse and cause file growth. This is a known trade-off in MVCC (multi-version concurrency control) systems — PostgreSQL has the same issue (table bloat).
+
+Free List: FIFO for Concurrent Access
+Freed pages are added to the list HEAD (newest version first).
+Pages are reused from the list TAIL (oldest version first).
+The tail is only consumed when the oldest page's version < minReader.
+Node pointers are cached in memory to avoid traversal from head to tail on each operation.
+
+Part VI: Query Language
+14. Parser
+Grammar Overview
+CREATE TABLE t (col type, ..., index (a,b), primary key (a));
+SELECT expr... FROM t [INDEX BY cond] [FILTER cond] [LIMIT x, y];
+INSERT INTO t (cols) VALUES (vals)...;
+DELETE FROM t [INDEX BY cond] [FILTER cond] [LIMIT x, y];
+UPDATE t SET col=expr,... [INDEX BY cond] [FILTER cond] [LIMIT x, y];
+
+Key Design: INDEX BY vs FILTER
+INDEX BY: uses the B-tree index for efficient range/point lookup. Controls row order.
+FILTER: post-scan predicate evaluated row-by-row. No index used. Can reference any column.
+Separating indexing from filtering is a deliberate simplification compared to SQL's WHERE clause. It makes query planning trivial — no query optimizer needed.
+
+Expression Parsing: Operator Precedence via Recursion
+Operator precedence is implemented as a call stack of mutually recursive functions, one per precedence level (lowest to highest):
+pExprTuple → pExprOr → pExprAnd → pExprNot → pExprCmp
+          → pExprAdd → pExprMul → pExprUnop → pExprAtom
+Each level parses its own operators and calls the next level for subexpressions. pExprAtom handles literals, column names, and parenthesized expressions (which recurse back to pExprTuple).
+
+15. Query Execution
+Execution Model
+Execution is simple interpreted evaluation — no compilation, no query plan tree:
+CREATE TABLE → direct call to TableNew().
+INSERT/UPDATE/DELETE → qlScan() to fetch rows, then loop over results calling the appropriate DB method.
+SELECT → qlScan() for rows, then qlEval() on each output expression.
+qlScan — Row Fetching
+Translates INDEX BY clause into Scanner (BIter + start/end keys).
+Iterates the scanner, applying LIMIT offset/count.
+Applies FILTER by evaluating the expression on each row; skips rows where result is 0.
+qlEval — Expression Evaluation
+Recursive AST walk. Context carries the current row (env) and the output value.
+Column names (QL_SYM) look up values from the current row.
+Literals (QL_I64, QL_STR) return their value directly.
+Operators recursively evaluate children then compute the result.
+Type errors are caught at eval time (dynamic typing).
+
+Reference: Key Design Decisions
+
+
+Reference: What's NOT Covered (Next Steps)
+Write-Ahead Log (WAL): the book uses CoW + fsync for crash safety. WAL is an alternative with better write throughput.
+LSM-Tree: covered conceptually; implementing one would be a good exercise.
+Joins, GROUP BY, aggregations: the query executor is glue code — adding these is straightforward.
+Client/server networking: needed for true multi-process access. The book mentions 'Build Your Own Redis' for this.
+Partial index serialization / covering indexes: the Deref() on secondary indexes always does a primary key lookup — this can be skipped if the index contains all needed columns.
+Conflict detection for concurrent writers: the book fully serializes writers. MVCC with conflict detection (optimistic locking) is left as an extension.
+
+— End of Reference —
